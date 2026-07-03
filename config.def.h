@@ -11,7 +11,7 @@
 #define FS 1
 
 /* Wallpaper script */
-#define CMD "echo \"%s\""
+#define CMD "~/wall.sh \"%s\""
 
 static const char *wdir = "Wallpapers";
 

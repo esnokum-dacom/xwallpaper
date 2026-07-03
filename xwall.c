@@ -164,6 +164,11 @@ void initx(Client *c) {
 	XNextEvent(c->d, &ev);
     } while (ev.type != MapNotify || ev.xmap.window != c->w);
 
+    XSetInputFocus(c->d, c->w, RevertToParent, CurrentTime);
+
+    if (XGrabKeyboard(c->d, c->w, True, GrabModeAsync, GrabModeAsync, CurrentTime) != GrabSuccess) {
+	fprintf(stderr, "Failed to grab keyboard\n");
+    }
 
     glXMakeCurrent(c->d, c->w, c->glc);
 
