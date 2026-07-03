@@ -1,12 +1,12 @@
 <div align="center">
   <h1>X WallPaper</h1>
     <div>
-      <p align="left">X Wallpaper is a wallpaper picker for X11, no dependencies, no extra commands, no for wayland, only select the directory, select the image and select the command or SH file to execute.</p>
+      <p align="left">X Wallpaper is a wallpaper picker for X11, with no dependencies, no extra commands, and no support for Wayland; just select the directory, select the image, and select the command or SH file to execute.</p>
+      <a href="https://github.com/esnokum-dacom/xwallpaper"><img src="https://github.com/esnokum-dacom/xwallpaper/blob/main/xwall.png" width="59%" align="right"></a>
     </div>
 </div> 
 
 <div align="center">
-  <h1>Keybinds</h1>
 
 | combo        | action     |
 | -------------| -----------|
@@ -41,7 +41,7 @@
   ```
 
 <div align="center">
-  <p align="left">To configure the path of the images you can go to</p>
+  <p align="left">To configure the path of the images, you can go to</p>
 </div>
 
 ```c
@@ -53,7 +53,7 @@ and select the directory in your home path
 
 
 <div align="center">
-  <p align="left">To configure the command, in config.def.h you can select the command to execute (If is a file you need to make it executable with)<p>
+  <p align="left">To configure the command, in config.def.h you can select the command to execute (if it is a file, you need to make it executable with)<p>
 </div>
 
 ```
@@ -73,7 +73,7 @@ where `\"%s\"` is the name of the file or the path, see like $1 in bash.
   <h1>Dependencies</h1>
 </div>
 
-- Xlib (obiusly)
+- Xlib (obviously)
 - Xinerama
 - Xft
 - Gl/GlX
