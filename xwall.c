@@ -8,7 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <errno.h>
 #include <unistd.h>
 
 #include "xwall.h"
@@ -39,6 +41,9 @@ static int selected = 0;
 
 static pthread_t loader_thread;
 static volatile int loader_done = 0;
+
+static char **wall_cmd_argv = NULL;
+static int wall_cmd_argc = 0;
 
 static void die(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -227,22 +232,50 @@ void nav_quit(Client *c) {
 }
 
 void nav_select(Client *c) {
-    (void)c;
     if (item_count == 0)
         return;
 
     const char *path = items[selected].path;
 
-    char cmd[2048];
-    int n = snprintf(cmd, sizeof(cmd), CMD, path);
-    if (n < 0 || (size_t)n >= sizeof(cmd)) {
-        fprintf(stderr, "command too long, not running\n");
+    if (wall_cmd_argc == 0) {
+        char cmd[2048];
+        int n = snprintf(cmd, sizeof(cmd), CMD, path);
+        if (n < 0 || (size_t)n >= sizeof(cmd)) {
+            fprintf(stderr, "command too long, not running\n");
+            nav_quit(c);
+            return;
+        }
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            return;
+        }
+        if (pid == 0) {
+            execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+            fprintf(stderr, "exec sh failed: %s\n", strerror(errno));
+            _exit(127);
+        }
         return;
     }
 
-    int ret = system(cmd);
-    if (ret != 0)
-        fprintf(stderr, "set_wallpaper command exited %d\n", ret);
+    char *exec_argv[wall_cmd_argc + 2];
+    for (int i = 0; i < wall_cmd_argc; i++)
+        exec_argv[i] = wall_cmd_argv[i];
+    exec_argv[wall_cmd_argc] = (char *)path;
+    exec_argv[wall_cmd_argc + 1] = NULL;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return;
+    }
+
+    if (pid == 0) {
+        execvp(exec_argv[0], exec_argv);
+        fprintf(stderr, "execvp %s failed: %s\n", exec_argv[0], strerror(errno));
+        _exit(127);
+    }
     nav_quit(c);
 }
 
@@ -798,7 +831,12 @@ void cleanup(Client *c) {
     XCloseDisplay(c->d);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    signal(SIGCHLD, SIG_IGN);
+
+    wall_cmd_argv = argv + 1;
+    wall_cmd_argc = argc - 1;
+
     Client c = {0};
     initx(&c);
     load_wallpapers_async(&c);

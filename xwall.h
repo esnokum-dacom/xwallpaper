@@ -5,6 +5,7 @@
 #include <X11/XKBlib.h>
 #include <X11/extensions/Xinerama.h>
 #include <X11/Xft/Xft.h>
+#include <sys/wait.h> 
 #include <sys/stat.h>
 #include <pthread.h>
 #include <Imlib2.h>
