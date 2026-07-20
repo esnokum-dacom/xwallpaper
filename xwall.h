@@ -94,6 +94,13 @@ const char *get_home(void);
 const char *get_dir(char *buf, size_t bufz);
 const char *read_dir(char *output_buffer, size_t buffer_size);
 
+// Ensure single instance
+static void release_lock(void);
+static void handle_term(int sig);
+static void get_lock_path(char *buf, size_t n);
+static void ensure_single_instance(void);
+
+
 // IMAGES HANDLERS
 GLuint load_image_texture(Client *c, const char *path, int *out_w, int *out_h);
 static unsigned char *decode_thumbnail(const char *path, int *out_w, int *out_h, int *out_src_w, int *out_src_h);
@@ -114,7 +121,7 @@ void handle_key(Client *c, XKeyEvent *e);
 
 /* UI */
 void draw_rect(int x, int y, int w, int h, float r, float g, float b, float a);
-void draw_text(Client *c, GLuint *ut, const char *msg, int *w, int *h);
+void draw_text(Client *c, GLuint *ut, const char *msg, int *w, int *h, size_t max_chars);
 void draw_hud(Client *c);
 
 static void *loader_main(void *arg);

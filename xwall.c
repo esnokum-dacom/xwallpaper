@@ -5,11 +5,15 @@
 #include <pwd.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/file.h>
+#include <sys/types.h>
 #include <errno.h>
 #include <unistd.h>
 
@@ -41,9 +45,14 @@ static int selected = 0;
 
 static pthread_t loader_thread;
 static volatile int loader_done = 0;
+static volatile int stop_loading = 0;
 
 static char **wall_cmd_argv = NULL;
 static int wall_cmd_argc = 0;
+
+static int lockfd = -1;
+static char lockpath[256];
+static Client *g_client = NULL;
 
 static void die(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -73,6 +82,77 @@ static int grid_rows(Client *c) {
 
 static int items_page(Client *c) {
     return grid_cols(c) * grid_rows(c);
+}
+
+static void release_lock(void) {
+    if (lockfd >= 0) {
+        flock(lockfd, LOCK_UN);
+        close(lockfd);
+        lockfd = -1;
+    }
+}
+
+static void handle_term(int sig) {
+    (void)sig;
+    if (g_client)
+        g_client->running = 0;
+}
+
+static void get_lock_path(char *buf, size_t n) {
+    const char *dir = getenv("XDG_RUNTIME_DIR");
+    if (!dir || !*dir)
+        dir = "/tmp";
+    snprintf(buf, n, "%s/sbtb.lock", dir);
+}
+
+static void ensure_single_instance(void) {
+    get_lock_path(lockpath, sizeof(lockpath));
+
+    for (;;) {
+        lockfd = open(lockpath, O_CREAT | O_RDWR, 0600);
+        if (lockfd < 0)
+            die("cannot open lock file");
+
+        if (flock(lockfd, LOCK_EX | LOCK_NB) == 0)
+            break;
+
+        if (errno != EWOULDBLOCK)
+            die("flock failed");
+
+        char buf[32] = {0};
+        pid_t pid = -1;
+        if (read(lockfd, buf, sizeof(buf) - 1) > 0)
+            pid = (pid_t)atoi(buf);
+
+        if (pid > 0) {
+            kill(pid, SIGTERM);
+            for (int i = 0; i < 100; i++) {
+                if (kill(pid, 0) != 0)
+                    break;
+            }
+            if (kill(pid, 0) == 0)
+                kill(pid, SIGKILL);
+        }
+
+        close(lockfd);
+        lockfd = -1;
+    }
+
+    if (ftruncate(lockfd, 0) != 0)
+        fprintf(stderr, "xwall: warning: ftruncate lock file failed\n");
+    char pidbuf[32];
+    int len = snprintf(pidbuf, sizeof(pidbuf), "%d\n", getpid());
+    lseek(lockfd, 0, SEEK_SET);
+    if (write(lockfd, pidbuf, len) != len)
+        fprintf(stderr, "xwall: warning: failed to record pid\n");
+
+    atexit(release_lock);
+
+    struct sigaction sa = {0};
+    sa.sa_handler = handle_term;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
 }
 
 void initx(Client *c) {
@@ -229,6 +309,7 @@ void nav_down(Client *c) {
 
 void nav_quit(Client *c) {
     c->running = 0;
+    stop_loading = 1;
 }
 
 void nav_select(Client *c) {
@@ -252,10 +333,13 @@ void nav_select(Client *c) {
             return;
         }
         if (pid == 0) {
+            close(ConnectionNumber(c->d));
+            setsid();
             execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
             fprintf(stderr, "exec sh failed: %s\n", strerror(errno));
             _exit(127);
         }
+        nav_quit(c);
         return;
     }
 
@@ -426,6 +510,144 @@ static unsigned char *decode_thumbnail(const char *path, int *out_w, int *out_h,
     return buf;
 }
 
+#define THUMB_CACHE_MAGIC   0x58575448u
+#define THUMB_CACHE_VERSION 1
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    int32_t  thumb_max;
+    int64_t  mtime;
+    int64_t  fsize;
+    int32_t  w, h;
+    int32_t  src_w, src_h;
+} ThumbCacheHeader;
+
+static unsigned long path_hash(const char *s) {
+    unsigned long h = 5381;
+    int ch;
+    while ((ch = (unsigned char)*s++))
+        h = ((h << 5) + h) + (unsigned long)ch;
+    return h;
+}
+
+static const char *get_cache_dir(char *buf, size_t bufz) {
+    const char *home = get_home();
+    if (!home)
+        return NULL;
+    snprintf(buf, bufz, "%s/.cache/xwall", home);
+
+    char tmp[1200];
+    snprintf(tmp, sizeof(tmp), "%s/.cache", home);
+    mkdir(tmp, 0700);
+    mkdir(buf, 0700);
+    return buf;
+}
+
+static void get_cache_path(const char *src_path, char *out, size_t outsz) {
+    char cdir[1024];
+    if (!get_cache_dir(cdir, sizeof(cdir))) {
+        out[0] = '\0';
+        return;
+    }
+    snprintf(out, outsz, "%s/%08lx.thumb", cdir, path_hash(src_path));
+}
+
+static unsigned char *load_cached_thumbnail(const char *src_path, const struct stat *st,
+                                             int *out_w, int *out_h, int *out_src_w, int *out_src_h) {
+    char cpath[1200];
+    get_cache_path(src_path, cpath, sizeof(cpath));
+    if (!cpath[0])
+        return NULL;
+
+    FILE *f = fopen(cpath, "rb");
+    if (!f)
+        return NULL;
+
+    ThumbCacheHeader hdr;
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1) {
+        fclose(f);
+        return NULL;
+    }
+
+    if (hdr.magic != THUMB_CACHE_MAGIC || hdr.version != THUMB_CACHE_VERSION ||
+        hdr.thumb_max != THUMB_MAX ||
+        hdr.mtime != (int64_t)st->st_mtime || hdr.fsize != (int64_t)st->st_size ||
+        hdr.w <= 0 || hdr.h <= 0) {
+        fclose(f);
+        return NULL;
+    }
+
+    size_t n = (size_t)hdr.w * (size_t)hdr.h * 4;
+    unsigned char *buf = malloc(n);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+
+    if (fread(buf, 1, n, f) != n) {
+        free(buf);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+
+    *out_w = hdr.w;
+    *out_h = hdr.h;
+    if (out_src_w) *out_src_w = hdr.src_w;
+    if (out_src_h) *out_src_h = hdr.src_h;
+    return buf;
+}
+
+static void save_cached_thumbnail(const char *src_path, const struct stat *st,
+                                   const unsigned char *pixels, int w, int h, int src_w, int src_h) {
+    char cpath[1200];
+    get_cache_path(src_path, cpath, sizeof(cpath));
+    if (!cpath[0])
+        return;
+
+    char tmp_path[1224];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp%d", cpath, (int)getpid());
+
+    FILE *f = fopen(tmp_path, "wb");
+    if (!f)
+        return;
+
+    ThumbCacheHeader hdr = {
+        .magic = THUMB_CACHE_MAGIC,
+        .version = THUMB_CACHE_VERSION,
+        .thumb_max = THUMB_MAX,
+        .mtime = (int64_t)st->st_mtime,
+        .fsize = (int64_t)st->st_size,
+        .w = w, .h = h,
+        .src_w = src_w, .src_h = src_h,
+    };
+
+    size_t n = (size_t)w * (size_t)h * 4;
+    if (fwrite(&hdr, sizeof(hdr), 1, f) != 1 || fwrite(pixels, 1, n, f) != n) {
+        fclose(f);
+        unlink(tmp_path);
+        return;
+    }
+    fclose(f);
+    rename(tmp_path, cpath);
+}
+
+static unsigned char *get_thumbnail(const char *path, int *out_w, int *out_h, int *out_src_w, int *out_src_h) {
+    struct stat st;
+    if (stat(path, &st) != 0)
+        return decode_thumbnail(path, out_w, out_h, out_src_w, out_src_h);
+
+    unsigned char *cached = load_cached_thumbnail(path, &st, out_w, out_h, out_src_w, out_src_h);
+    if (cached)
+        return cached;
+
+    unsigned char *fresh = decode_thumbnail(path, out_w, out_h, out_src_w, out_src_h);
+    if (fresh)
+        save_cached_thumbnail(path, &st, fresh, *out_w, *out_h, *out_src_w, *out_src_h);
+    return fresh;
+}
+
 static void *loader_main(void *arg) {
     (void)arg;
     char dir[1024];
@@ -445,11 +667,17 @@ static void *loader_main(void *arg) {
     item_count = 0;
 
     for (int i = 0; i < n; i++) {
+        if (stop_loading) {
+            for (; i < n; i++)
+                free(files[i]);
+            break;
+        }
+
         char path[2048];
         snprintf(path, sizeof(path), "%s/%s", dir, files[i]);
 
         int w, h, src_w, src_h;
-        unsigned char *px = decode_thumbnail(path, &w, &h, &src_w, &src_h);
+        unsigned char *px = get_thumbnail(path, &w, &h, &src_w, &src_h);
         free(files[i]);
         if (!px)
             continue;
@@ -648,10 +876,25 @@ static void draw_highlight(int x, int y, int w, int h) {
     glEnable(GL_TEXTURE_2D);
 }
 
-void draw_text(Client *c, GLuint *ut, const char *msg, int *w, int *h) {
+void draw_text(Client *c, GLuint *ut, const char *msg, int *w, int *h, size_t max_chars) {
     if (*ut) glDeleteTextures(1, ut);
+
     XGlyphInfo ext;
-    *ut = make_text_texture(c, msg, &ext);
+    size_t len = strlen(msg);
+
+    if (max_chars > 0 && len > max_chars) {
+	char buffer[512];
+
+	if (max_chars > sizeof(buffer) - 4)
+	    max_chars = sizeof(buffer) - 4;
+
+	strncpy(buffer, msg, max_chars);
+	strcpy(buffer + max_chars, "...");
+
+	*ut = make_text_texture(c, buffer, &ext);
+    } else {
+	*ut = make_text_texture(c, msg, &ext);
+    }
     
     if (w) *w = ext.width;
     if (h) *h = ext.height;
@@ -714,6 +957,8 @@ char *get_namef() {
 }
 
 void draw_hud(Client *c) {
+    size_t max_c = 30;
+
     char fs[128];
     char titleimg[256];
     char size[128];
@@ -726,10 +971,10 @@ void draw_hud(Client *c) {
     snprintf(ftex, sizeof(ftex), "%s", get_ext(items[selected].path));
     format_size(get_file_size(items[selected].path), size, sizeof(size));
 
-    draw_text(c, &fis, fs, &fs_w, &fs_h);
-    draw_text(c, &tim, titleimg, &tim_w, &tim_h);
-    draw_text(c, &sz, size, &sz_w, &sz_h);
-    draw_text(c, &fm, ftex, &fm_w, &fm_h);
+    draw_text(c, &fis, fs, &fs_w, &fs_h, max_c);
+    draw_text(c, &tim, titleimg, &tim_w, &tim_h, max_c);
+    draw_text(c, &sz, size, &sz_w, &sz_h, max_c);
+    draw_text(c, &fm, ftex, &fm_w, &fm_h, max_c);
 
     glColor4f(0.0f, 0.0f, 0.0f, 1.0f);
     
@@ -836,6 +1081,8 @@ int main(int argc, char **argv) {
 
     wall_cmd_argv = argv + 1;
     wall_cmd_argc = argc - 1;
+
+    ensure_single_instance();
 
     Client c = {0};
     initx(&c);
